@@ -1,10 +1,24 @@
 import numpy as np
-import os
+import os, re
 import argparse
 from PIL import Image
 
 from chainer import cuda, Variable, optimizers, serializers
 from net import *
+
+def load_image(path, size):
+    image = Image.open(path).convert('RGB')
+    w,h = image.size
+    if w < h:
+        if w < size:
+            image = image.resize((size, size*h/w))
+            w, h = image.size
+    else:
+        if h < size:
+            image = image.resize((size*w/h, size))
+            w, h = image.size
+    image = image.crop(((w-size)*0.5, (h-size)*0.5, (w+size)*0.5, (h+size)*0.5))
+    return xp.asarray(image, dtype=np.float32).transpose(2, 0, 1)
 
 def gram_matrix(y):
     b, ch, h, w = y.data.shape
@@ -31,11 +45,13 @@ parser.add_argument('--dataset', '-d', default='dataset', type=str,
                     help='dataset directory path (according to the paper, use MSCOCO 80k images)')
 parser.add_argument('--style_image', '-s', type=str, required=True,
                     help='style image path')
-parser.add_argument('--batchsize', '-b', type=int, default=4,
-                    help='batch size (default value is 4)')
-parser.add_argument('--input', '-i', default=None, type=str,
-                    help='input model file path without extension')
-parser.add_argument('--output', '-o', default='out', type=str,
+parser.add_argument('--batchsize', '-b', type=int, default=1,
+                    help='batch size (default value is 1)')
+parser.add_argument('--initmodel', '-i', default=None, type=str,
+                    help='initialize the model from given file')
+parser.add_argument('--resume', '-r', default=None, type=str,
+                    help='resume the optimization from snapshot')
+parser.add_argument('--output', '-o', default=None, type=str,
                     help='output model file path without extension')
 parser.add_argument('--lambda_tv', default=10e-4, type=float,
                     help='weight of total variation regularization according to the paper to be set between 10e-4 and 10e-6.')
@@ -44,14 +60,18 @@ parser.add_argument('--lambda_style', default=1e1, type=float)
 parser.add_argument('--epoch', '-e', default=2, type=int)
 parser.add_argument('--lr', '-l', default=1e-3, type=float)
 parser.add_argument('--checkpoint', '-c', default=0, type=int)
+parser.add_argument('--image_size', default=256, type=int)
 args = parser.parse_args()
 
 batchsize = args.batchsize
 
+image_size = args.image_size
 n_epoch = args.epoch
 lambda_tv = args.lambda_tv
 lambda_f = args.lambda_feat
 lambda_s = args.lambda_style
+style_prefix, _ = os.path.splitext(os.path.basename(args.style_image))
+output = style_prefix if args.output == None else args.output
 fs = os.listdir(args.dataset)
 imagepaths = []
 for fn in fs:
@@ -67,6 +87,9 @@ print n_iter, 'iterations,', n_epoch, 'epochs'
 model = FastStyleNet()
 vgg = VGG()
 serializers.load_npz('vgg16.model', vgg)
+if args.initmodel:
+    print 'load model from', args.initmodel
+    serializers.load_npz(args.initmodel, model)
 if args.gpu >= 0:
     cuda.get_device(args.gpu).use()
     model.to_gpu()
@@ -75,8 +98,11 @@ xp = np if args.gpu < 0 else cuda.cupy
 
 O = optimizers.Adam(alpha=args.lr)
 O.setup(model)
+if args.resume:
+    print 'load optimizer state from', args.resume
+    serializers.load_npz(args.resume, O)
 
-style = vgg.preprocess(np.asarray(Image.open(args.style_image).convert('RGB').resize((256,256)), dtype=np.float32))
+style = vgg.preprocess(np.asarray(Image.open(args.style_image).convert('RGB').resize((image_size,image_size)), dtype=np.float32))
 style = xp.asarray(style, dtype=xp.float32)
 style_b = xp.zeros((batchsize,) + style.shape, dtype=xp.float32)
 for i in range(batchsize):
@@ -91,15 +117,17 @@ for epoch in range(n_epoch):
         vgg.zerograds()
 
         indices = range(i * batchsize, (i+1) * batchsize)
-        x = xp.zeros((batchsize, 3, 256, 256), dtype=xp.float32)
+        x = xp.zeros((batchsize, 3, image_size, image_size), dtype=xp.float32)
         for j in range(batchsize):
-            x[j] = xp.asarray(Image.open(imagepaths[i*batchsize + j]).convert('RGB').resize((256,256)), dtype=np.float32).transpose(2, 0, 1)
+            x[j] = load_image(imagepaths[i*batchsize + j], image_size)
 
-        x -= 120 # subtract mean
         xc = Variable(x.copy(), volatile=True)
         x = Variable(x)
 
         y = model(x)
+
+        xc -= 120
+        y -= 120
 
         feature = vgg(xc)
         feature_hat = vgg(y)
@@ -119,9 +147,12 @@ for epoch in range(n_epoch):
         O.update()
 
         if args.checkpoint > 0 and i % args.checkpoint == 0:
-            serializers.save_npz('models/style_{}_{}.model'.format(epoch, i), model)
+            serializers.save_npz('models/{}_{}_{}.model'.format(output, epoch, i), model)
+            serializers.save_npz('models/{}_{}_{}.state'.format(output, epoch, i), O)
 
     print 'save "style.model"'
-    serializers.save_npz('models/style_{}.model'.format(epoch), model)
+    serializers.save_npz('models/{}_{}.model'.format(output, epoch), model)
+    serializers.save_npz('models/{}_{}.state'.format(output, epoch), O)
 
-serializers.save_npz('models/style.model'.format(epoch), model)
+serializers.save_npz('models/{}.model'.format(output), model)
+serializers.save_npz('models/{}.state'.format(output), O)
